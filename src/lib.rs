@@ -1,10 +1,11 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use futures::Future;
-use std::pin::Pin;
+use futures::future::{BoxFuture, Future};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+type BoxFn = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
 enum JobType {
     Once {
@@ -20,37 +21,37 @@ enum JobType {
 pub struct Job {
     id: Uuid,
     job_type: JobType,
-    func: Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> + Send + Sync>,
+    func: BoxFn,
 }
 
-pub async fn test() {}
-
 impl Job {
-    pub fn once(
-        deadline: DateTime<Utc>,
-        func: Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> + Send + Sync>,
-    ) -> Job {
+    pub fn once<F, Fut>(deadline: DateTime<Utc>, f: F) -> Job
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + Sync + 'static,
+    {
         Job {
             id: Uuid::new_v4(),
             job_type: JobType::Once {
                 deadline,
                 done: false,
             },
-            func,
+            func: Box::new(move || Box::pin(f())),
         }
     }
 
-    pub fn periodically(
-        interval: Duration,
-        func: Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> + Send + Sync>,
-    ) -> Job {
+    pub fn periodically<F, Fut>(interval: Duration, f: F) -> Job
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + Sync + 'static,
+    {
         Job {
             id: Uuid::new_v4(),
             job_type: JobType::Periodically {
                 interval: ChronoDuration::from_std(interval).unwrap(),
                 last_run: None,
             },
-            func,
+            func: Box::new(move || Box::pin(f())),
         }
     }
 
@@ -108,19 +109,21 @@ impl JobExecutor {
         job_id
     }
 
-    pub async fn jobs_loop(&self, interval: Duration) {
+    pub async fn event_loop(&self, interval: Duration) {
         loop {
             {
-                let mut jobs = self.jobs.write().await;
                 let mut done_jobs = Vec::new();
-                for (i, job) in jobs.iter_mut().enumerate() {
+                let mut jobs = self.jobs.write().await;
+                for job in jobs.iter_mut() {
                     job.tick().await;
                     if job.is_done() {
-                        done_jobs.push(i);
+                        done_jobs.push(job.id);
                     };
                 }
-                for i in done_jobs {
-                    jobs.remove(i);
+                if !done_jobs.is_empty() {
+                    for id in done_jobs {
+                        jobs.retain(|job| job.id != id);
+                    }
                 }
             }
             tokio::time::delay_for(interval).await;
@@ -134,14 +137,24 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use std::time::Duration;
 
-    fn hello_job() -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
-        println!("Hello job PERIODICALLY");
-        Box::pin(async {})
+    struct Service;
+
+    impl Service {
+        pub fn new() -> Service {
+            Service
+        }
+
+        pub async fn hello_job(&self) {
+            println!("Hello job SERVICE SELF");
+        }
     }
 
-    fn once_hello_job() -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
+    async fn hello_job() {
+        println!("Hello job PERIODICALLY");
+    }
+
+    async fn once_hello_job() {
         println!("Hello job ONCE");
-        Box::pin(async {})
     }
 
     #[tokio::test]
@@ -149,19 +162,29 @@ mod tests {
         let job_executor = Arc::new(JobExecutor::new());
         let job_executor_clone = job_executor.clone();
         let handle = tokio::task::spawn(async move {
-            job_executor_clone.jobs_loop(Duration::from_secs(1)).await;
+            job_executor_clone.event_loop(Duration::from_secs(1)).await;
         });
+
+        let service = Arc::new(Service::new());
+        let serive_clone = service.clone();
+
         job_executor
             .add(Job::once(
                 Utc::now() + ChronoDuration::seconds(5),
-                Box::new(once_hello_job),
+                once_hello_job,
             ))
             .await;
         job_executor
-            .add(Job::periodically(
-                Duration::from_secs(2),
-                Box::new(hello_job),
+            .add(Job::once(
+                Utc::now() + ChronoDuration::seconds(5),
+                move || {
+                    let serive_clone = serive_clone.clone();
+                    async move { serive_clone.hello_job().await }
+                },
             ))
+            .await;
+        job_executor
+            .add(Job::periodically(Duration::from_secs(2), hello_job))
             .await;
         handle.await.unwrap();
     }
