@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-type BoxFn = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+type BoxFn = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static>;
 
 enum JobType {
     Once {
@@ -32,7 +32,7 @@ impl Job {
     pub fn once<F, Fut>(deadline: DateTime<Utc>, f: F) -> Job
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         Job {
             id: Uuid::new_v4(),
@@ -47,7 +47,7 @@ impl Job {
     pub fn periodically<F, Fut>(interval: Duration, f: F) -> Job
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         Job {
             id: Uuid::new_v4(),
@@ -62,7 +62,7 @@ impl Job {
     pub fn periodically_at<F, Fut>(run_at: NaiveTime, f: F) -> Job
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         Job {
             id: Uuid::new_v4(),
