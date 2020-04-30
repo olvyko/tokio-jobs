@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+pub use chrono::{DateTime, Duration as ChronoDuration, NaiveTime, Utc};
 use futures::future::{BoxFuture, Future};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +15,10 @@ enum JobType {
     Periodically {
         interval: ChronoDuration,
         last_run: Option<DateTime<Utc>>,
+    },
+    PeriodicallyAt {
+        run_at: NaiveTime,
+        was_run: bool,
     },
 }
 
@@ -55,6 +59,21 @@ impl Job {
         }
     }
 
+    pub fn periodically_at<F, Fut>(run_at: NaiveTime, f: F) -> Job
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + Sync + 'static,
+    {
+        Job {
+            id: Uuid::new_v4(),
+            job_type: JobType::PeriodicallyAt {
+                run_at: run_at,
+                was_run: false,
+            },
+            func: Box::new(move || Box::pin(f())),
+        }
+    }
+
     pub fn is_done(&self) -> bool {
         match self.job_type {
             JobType::Once { deadline: _, done } => done,
@@ -71,7 +90,6 @@ impl Job {
                 if *done {
                     return;
                 };
-
                 if deadline <= Utc::now() {
                     (self.func)().await;
                     *done = true;
@@ -86,6 +104,19 @@ impl Job {
                 {
                     (self.func)().await;
                     *last_run = Some(Utc::now());
+                };
+            }
+            JobType::PeriodicallyAt {
+                run_at,
+                ref mut was_run,
+            } => {
+                let now = Utc::now().time();
+                if !*was_run && now >= run_at {
+                    (self.func)().await;
+                    *was_run = true;
+                };
+                if *was_run && now < run_at {
+                    *was_run = false;
                 };
             }
         }
@@ -153,6 +184,10 @@ mod tests {
         println!("Hello job PERIODICALLY");
     }
 
+    async fn hello_job_at() {
+        println!("Hello job PERIODICALLY AT {}", Utc::now().time());
+    }
+
     async fn once_hello_job() {
         println!("Hello job ONCE");
     }
@@ -185,6 +220,12 @@ mod tests {
             .await;
         job_executor
             .add(Job::periodically(Duration::from_secs(2), hello_job))
+            .await;
+        let now = Utc::now().time();
+        println!("Time now {}", now);
+        let now_plus = now + ChronoDuration::seconds(5);
+        job_executor
+            .add(Job::periodically_at(now_plus, hello_job_at))
             .await;
         handle.await.unwrap();
     }
