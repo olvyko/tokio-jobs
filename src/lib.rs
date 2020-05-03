@@ -124,27 +124,33 @@ impl Job {
 }
 
 pub struct JobExecutor {
+    added_jobs: Arc<RwLock<Vec<Job>>>,
     jobs: Arc<RwLock<Vec<Job>>>,
 }
 
 impl JobExecutor {
     pub fn new() -> JobExecutor {
         JobExecutor {
+            added_jobs: Arc::new(RwLock::new(Vec::new())),
             jobs: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
     pub async fn add(&self, job: Job) -> Uuid {
         let job_id = job.id;
-        self.jobs.write().await.push(job);
+        self.added_jobs.write().await.push(job);
         job_id
     }
 
     pub async fn event_loop(&self, interval: Duration) {
         loop {
             {
-                let mut done_jobs = Vec::new();
                 let mut jobs = self.jobs.write().await;
+                {
+                    let added_jobs = &mut self.added_jobs.write().await;
+                    jobs.append(added_jobs);
+                }
+                let mut done_jobs = Vec::new();
                 for job in jobs.iter_mut() {
                     job.tick().await;
                     if job.is_done() {
