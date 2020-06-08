@@ -1,11 +1,12 @@
 pub use chrono::{DateTime, Duration as ChronoDuration, NaiveTime, Utc};
-use futures::future::{BoxFuture, Future};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-type BoxFn = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static>;
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 enum JobType {
     Once {
@@ -18,14 +19,14 @@ enum JobType {
     },
     PeriodicallyAt {
         run_at: NaiveTime,
-        was_run: bool,
+        was_run_at: Option<DateTime<Utc>>,
     },
 }
 
 pub struct Job {
     id: Uuid,
     job_type: JobType,
-    func: BoxFn,
+    func: Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static>,
 }
 
 impl Job {
@@ -36,10 +37,7 @@ impl Job {
     {
         Job {
             id: Uuid::new_v4(),
-            job_type: JobType::Once {
-                deadline,
-                done: false,
-            },
+            job_type: JobType::Once { deadline, done: false },
             func: Box::new(move || Box::pin(f())),
         }
     }
@@ -68,7 +66,7 @@ impl Job {
             id: Uuid::new_v4(),
             job_type: JobType::PeriodicallyAt {
                 run_at: run_at,
-                was_run: false,
+                was_run_at: None,
             },
             func: Box::new(move || Box::pin(f())),
         }
@@ -83,10 +81,7 @@ impl Job {
 
     pub async fn tick(&mut self) {
         match self.job_type {
-            JobType::Once {
-                deadline,
-                ref mut done,
-            } => {
+            JobType::Once { deadline, ref mut done } => {
                 if *done {
                     return;
                 };
@@ -99,25 +94,22 @@ impl Job {
                 interval,
                 ref mut last_run,
             } => {
-                if last_run.is_none()
-                    || last_run.unwrap().signed_duration_since(Utc::now()) <= interval
-                {
+                if last_run.is_none() || last_run.unwrap().signed_duration_since(Utc::now()) <= interval {
                     (self.func)().await;
                     *last_run = Some(Utc::now());
                 };
             }
             JobType::PeriodicallyAt {
                 run_at,
-                ref mut was_run,
+                ref mut was_run_at,
             } => {
-                let now = Utc::now().time();
-                if !*was_run && now >= run_at {
-                    (self.func)().await;
-                    *was_run = true;
-                };
-                if *was_run && now < run_at {
-                    *was_run = false;
-                };
+                let now = Utc::now();
+                if was_run_at.is_none() || now.date() != was_run_at.unwrap().date() {
+                    if now.time() >= run_at {
+                        (self.func)().await;
+                        *was_run_at = Some(now);
+                    }
+                }
             }
         }
     }
@@ -210,19 +202,13 @@ mod tests {
         let serive_clone = service.clone();
 
         job_executor
-            .add(Job::once(
-                Utc::now() + ChronoDuration::seconds(5),
-                once_hello_job,
-            ))
+            .add(Job::once(Utc::now() + ChronoDuration::seconds(5), once_hello_job))
             .await;
         job_executor
-            .add(Job::once(
-                Utc::now() + ChronoDuration::seconds(5),
-                move || {
-                    let serive_clone = serive_clone.clone();
-                    async move { serive_clone.hello_job().await }
-                },
-            ))
+            .add(Job::once(Utc::now() + ChronoDuration::seconds(5), move || {
+                let serive_clone = serive_clone.clone();
+                async move { serive_clone.hello_job().await }
+            }))
             .await;
         job_executor
             .add(Job::periodically(Duration::from_secs(2), hello_job))
@@ -230,9 +216,7 @@ mod tests {
         let now = Utc::now().time();
         println!("Time now {}", now);
         let now_plus = now + ChronoDuration::seconds(5);
-        job_executor
-            .add(Job::periodically_at(now_plus, hello_job_at))
-            .await;
+        job_executor.add(Job::periodically_at(now_plus, hello_job_at)).await;
         handle.await.unwrap();
     }
 }
